@@ -67,7 +67,10 @@ scan_index = 0
 def instrument_has_open_position(instrument: str, positions: list[dict] | None = None) -> bool:
     open_positions = positions if positions is not None else mt5_broker.positions()
     normalized = instrument.upper()
-    return any(position["symbol"].upper().startswith(normalized) for position in open_positions)
+    if any(position["symbol"].upper().startswith(normalized) for position in open_positions):
+        return True
+    pending_orders = mt5_broker.pending_orders()
+    return any(order["symbol"].upper().startswith(normalized) for order in pending_orders)
 
 
 def analyze_market() -> dict:
@@ -104,30 +107,53 @@ def analyze_instrument(instrument: str, for_execution: bool = False) -> dict:
     except RuntimeError as error:
         raise HTTPException(status_code=503, detail=f"MT5 market data unavailable: {error}") from error
     direction = snapshot.get("direction", "BUY")
-    pip_size = market_data.pip_sizes[instrument]
+    pip_size = float(snapshot.get("pip_size", market_data.pip_sizes[instrument]))
     price = snapshot["price"]
     take_profit_pips = DEFAULT_TP_PIPS
     stop_loss_pips = int(os.getenv("DEFAULT_STOP_LOSS_PIPS", "100"))
     candle_signal = snapshot.get("candle_signal", {})
-    score = int(os.getenv("BOT_MIN_SCORE", "84")) if candle_signal.get("qualified") else 0
+    strategy = snapshot.get("strategy", {})
+    score = 0
+    if candle_signal.get("qualified"):
+        score += 30
+    if strategy.get("direction") == direction:
+        score += 20
+    rsi = float(strategy.get("rsi", 50))
+    momentum_allowed = 50 <= rsi <= 72 if direction == "BUY" else 28 <= rsi <= 50
+    if momentum_allowed:
+        score += 15
     direction_aligned = candle_signal.get("direction") in (None, direction)
     spread_allowed = snapshot["spread_pips"] <= MAX_SPREAD_PIPS
     aligned_timeframes = [timeframe for timeframe, higher_snapshot in higher_timeframes.items() if higher_snapshot["direction"] == direction]
     trend_confluence = len(aligned_timeframes) >= 3
     bias_confirmed = trend_confluence and direction in ("BUY", "SELL")
-    can_trade = score >= 70 and candle_signal.get("qualified", False) and direction_aligned and spread_allowed and trend_confluence
+    if trend_confluence:
+        score += 25
+    if spread_allowed:
+        score += 10
+    minimum_score = int(os.getenv("BOT_MIN_SCORE", "84"))
+    can_trade = score >= minimum_score and candle_signal.get("qualified", False) and direction_aligned and spread_allowed and trend_confluence and momentum_allowed
     distance_tp = take_profit_pips * pip_size
     distance_sl = stop_loss_pips * pip_size
-    reason = "Confirmation score, trend, M5 impulse, and spread gates passed"
+    entry_price = price
+    entry_type = "MARKET"
+    trend_average = float(snapshot.get("trend_average", price))
+    pullback_gap_pips = abs(price - trend_average) / pip_size if pip_size else 0
+    if can_trade and 3 <= pullback_gap_pips <= 30 and ((direction == "BUY" and trend_average < price) or (direction == "SELL" and trend_average > price)):
+        entry_price = trend_average
+        entry_type = "LIMIT"
+    reason = f"Strategy score {score}/100: trend, momentum, impulse candle, spread, and {len(aligned_timeframes)}/4 timeframe alignment passed"
     if not candle_signal.get("qualified", False):
         reason = candle_signal.get("reason", "Waiting for a qualified M5 candle")
     elif not direction_aligned:
         reason = "M5 candle direction does not match the trend"
     elif not spread_allowed:
         reason = f"Spread {snapshot['spread_pips']} pips exceeds the {MAX_SPREAD_PIPS} pip limit"
+    elif not momentum_allowed:
+        reason = f"RSI momentum filter is not aligned with {direction} ({rsi:.1f})"
     elif not trend_confluence:
         reason = f"Multi-timeframe trend confirmation is incomplete ({len(aligned_timeframes)}/4 aligned)"
-    return {"instrument": instrument, "direction": direction, "score": min(100, score + (10 if trend_confluence else 0)), "decision": "TRADE" if can_trade else "WAIT" if for_execution else "Signal confirmed" if score >= 70 else "Waiting for M5 impulse", "entry_zone": f"{price - pip_size * 6:.{5 if pip_size < 0.01 else 2}f} - {price + pip_size * 6:.{5 if pip_size < 0.01 else 2}f}", "entry_price": price, "stop_loss": round(price - distance_sl if direction == "BUY" else price + distance_sl, 5), "take_profit": round(price + distance_tp if direction == "BUY" else price - distance_tp, 5), "take_profit_pips": take_profit_pips, "stop_loss_pips": stop_loss_pips, "bias_confirmed": bias_confirmed, "entry_confirmed": can_trade, "confirmation": "Entry confirmed" if can_trade else "Bias confirmed" if bias_confirmed else "Waiting", "reason": reason, "market": snapshot, "timeframes": {"M5": {"direction": direction, "qualified": candle_signal.get("qualified", False)}, **{timeframe: {"direction": value["direction"], "trend_average": value["trend_average"]} for timeframe, value in higher_timeframes.items()}}, "timeframe_confluence": {"aligned": aligned_timeframes, "aligned_count": len(aligned_timeframes), "required": 3}, "analyzed_at": datetime.now(UTC).isoformat()}
+    return {"instrument": instrument, "direction": direction, "score": min(100, score), "decision": "TRADE" if can_trade else "WAIT" if for_execution else "Signal confirmed" if score >= 70 else "Waiting for M5 impulse", "entry_zone": f"{entry_price - pip_size * 6:.{5 if pip_size < 0.01 else 2}f} - {entry_price + pip_size * 6:.{5 if pip_size < 0.01 else 2}f}", "entry_price": round(entry_price, int(snapshot.get("digits", 5))), "entry_type": entry_type, "pullback_gap_pips": round(pullback_gap_pips, 1), "stop_loss": round(entry_price - distance_sl if direction == "BUY" else entry_price + distance_sl, int(snapshot.get("digits", 5))), "take_profit": round(entry_price + distance_tp if direction == "BUY" else entry_price - distance_tp, int(snapshot.get("digits", 5))), "take_profit_pips": take_profit_pips, "stop_loss_pips": stop_loss_pips, "pip_size": pip_size, "bias_confirmed": bias_confirmed, "entry_confirmed": can_trade, "confirmation": "Entry confirmed" if can_trade else "Bias confirmed" if bias_confirmed else "Waiting", "reason": reason, "market": snapshot, "timeframes": {"M5": {"direction": direction, "qualified": candle_signal.get("qualified", False)}, **{timeframe: {"direction": value["direction"], "trend_average": value["trend_average"]} for timeframe, value in higher_timeframes.items()}}, "timeframe_confluence": {"aligned": aligned_timeframes, "aligned_count": len(aligned_timeframes), "required": 3}, "analyzed_at": datetime.now(UTC).isoformat()}
 
 
 def execute_bot_trade(analysis: dict) -> dict:
@@ -137,8 +163,11 @@ def execute_bot_trade(analysis: dict) -> dict:
     positions = mt5_broker.positions()
     if instrument_has_open_position(request.instrument, positions):
         raise RuntimeError(f"{request.instrument} already has an open MT5 position")
-    orders = mt5_broker.open_market_orders(request.instrument, request.direction, request.positions, request.take_profit_pips, request.stop_loss_pips)
-    return {"mode": "live", "status": "OPEN", "orders": orders, "opened_at": datetime.now(UTC).isoformat()}
+    if analysis.get("entry_type") == "LIMIT":
+        orders = mt5_broker.open_limit_orders(request.instrument, request.direction, request.positions, analysis["entry_price"], request.take_profit_pips, request.stop_loss_pips)
+    else:
+        orders = mt5_broker.open_market_orders(request.instrument, request.direction, request.positions, request.take_profit_pips, request.stop_loss_pips)
+    return {"mode": "live", "status": "OPEN", "entry_type": analysis.get("entry_type", "MARKET"), "target_pips": DEFAULT_TP_PIPS, "orders": orders, "opened_at": datetime.now(UTC).isoformat()}
 
 
 def bot_analyze() -> dict:
