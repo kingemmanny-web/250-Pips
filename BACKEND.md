@@ -10,7 +10,7 @@ From the project root:
 .\run-backend.ps1
 ```
 
-The API runs at `http://127.0.0.1:8000`. Interactive API docs are available at `http://127.0.0.1:8000/docs`.
+The API runs at `http://127.0.0.1:8000` locally. Interactive API docs are available at `http://127.0.0.1:8000/docs`. The launcher binds to `0.0.0.0` and honors the hosting platform's `PORT` variable when deployed.
 
 Run `.\run-backend.ps1` from the project root. It loads `.env` as the project configuration source; this prevents stale global trading flags from overriding the project configuration. Keep `LIVE_TRADING_ENABLED=false` while validating a demo connection. To submit demo or live MT5 orders, set it to `true` and set `LIVE_TRADING_CONFIRMATION=I_UNDERSTAND_REAL_MONEY` only after verifying the account and symbol settings.
 
@@ -22,7 +22,7 @@ MT5_ACCOUNTS=[{"id":"demo-1","path":"C:/MT5/Demo/terminal64.exe","login":123456,
 
 Do not put credentials in source control. The bot skips an account with an existing position/order and reports per-account execution results; it trades only on profiles that connect successfully.
 
-The frontend uses `http://127.0.0.1:8000` during local Vite development. For a deployed frontend, set the Vercel environment variable `VITE_API_BASE_URL` to the public backend origin, without `/api`. Set the backend variable `FRONTEND_ORIGINS` to `https://250pips.vercel.app`, then redeploy both services.
+The frontend uses `http://127.0.0.1:8000` during local Vite development. Deploy the frontend and this FastAPI service separately: Vercel serves the Vite build, while the backend must run on a Windows host with MetaTrader 5 installed and logged into the account. Set the Vercel environment variable `VITE_API_BASE_URL` to the public backend origin, without `/api` (for example, `https://api.example.com`). Set the backend variable `FRONTEND_ORIGINS` to the exact deployed frontend origin (for example, `https://250pips.vercel.app`), then redeploy both services. Do not deploy the MT5 backend as a Vercel serverless function; the MetaTrader 5 Python bridge requires a local MT5 terminal process.
 
 ## Endpoints
 

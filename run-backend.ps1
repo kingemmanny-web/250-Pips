@@ -21,4 +21,6 @@ if (Test-Path $envFile) {
 	}
 }
 
-& $python -m uvicorn backend.app.main:app --host 127.0.0.1 --port 8000
+$bindHost = if ($env:HOST) { $env:HOST } else { '0.0.0.0' }
+$port = if ($env:PORT) { $env:PORT } else { '8000' }
+& $python -m uvicorn backend.app.main:app --host $bindHost --port $port
