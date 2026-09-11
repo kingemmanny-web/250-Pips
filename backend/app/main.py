@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 import sqlite3
 import threading
 from datetime import UTC, datetime
@@ -13,6 +14,7 @@ from pydantic import BaseModel, Field
 
 from backend.app.bot_controller import BotController
 from backend.app.mt5_adapter import MT5Adapter
+from backend.app.news_calendar import EconomicCalendar
 
 ROOT = Path(__file__).resolve().parents[2]
 DATABASE_PATH = Path(os.getenv("DATABASE_PATH", str(ROOT / "backend" / "data" / "trading.sqlite3")))
@@ -20,15 +22,19 @@ DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
 MAX_POSITIONS_PER_CYCLE = 4
 DEFAULT_TP_PIPS = 250
 DEFAULT_SL_PIPS = int(os.getenv("DEFAULT_STOP_LOSS_PIPS", "100"))
+RISK_PERCENT = min(2.0, max(1.0, float(os.getenv("RISK_PERCENT", "1"))))
+RISK_REWARD_RATIO = float(os.getenv("RISK_REWARD_RATIO", "2"))
 MAX_SPREAD_PIPS = float(os.getenv("MAX_SPREAD_PIPS", "1.5"))
 LIVE_TRADING_ENABLED = os.getenv("LIVE_TRADING_ENABLED", "false").lower() == "true"
 LIVE_TRADING_CONFIRMATION = os.getenv("LIVE_TRADING_CONFIRMATION", "") == "I_UNDERSTAND_REAL_MONEY"
 BOT_INTERVAL_SECONDS = int(os.getenv("BOT_INTERVAL_SECONDS", "60"))
 BOT_AUTOSTART = os.getenv("BOT_AUTOSTART", "true").lower() == "true"
 SCAN_INSTRUMENTS = ("EURUSD", "GBPUSD", "XAUUSD", "BTCUSD")
+FRONTEND_ORIGINS = [origin.strip() for origin in os.getenv("FRONTEND_ORIGINS", "").split(",") if origin.strip()]
+DEFAULT_FRONTEND_ORIGINS = ["https://250pips.vercel.app", "http://127.0.0.1:4173", "http://127.0.0.1:4174", "http://127.0.0.1:5173", "http://127.0.0.1:5174", "http://localhost:4173", "http://localhost:4174", "http://localhost:5173", "http://localhost:5174"]
 
 app = FastAPI(title="250 Pips Trading API", version="0.1.0")
-app.add_middleware(CORSMiddleware, allow_origins=["http://127.0.0.1:4173", "http://127.0.0.1:4174", "http://127.0.0.1:5173", "http://127.0.0.1:5174", "http://localhost:4173", "http://localhost:4174", "http://localhost:5173", "http://localhost:5174"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(CORSMiddleware, allow_origins=DEFAULT_FRONTEND_ORIGINS + FRONTEND_ORIGINS, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 
 class CycleRequest(BaseModel):
@@ -60,6 +66,11 @@ class MarketConfig:
 
 market_data = MarketConfig()
 mt5_broker = MT5Adapter()
+economic_calendar = EconomicCalendar()
+try:
+    CENTRAL_BANK_RATES = {key.upper(): float(value) for key, value in json.loads(os.getenv("CENTRAL_BANK_RATES", "{} ")).items()}
+except (TypeError, ValueError, json.JSONDecodeError):
+    CENTRAL_BANK_RATES = {}
 scan_lock = threading.Lock()
 scan_index = 0
 
@@ -106,54 +117,79 @@ def analyze_instrument(instrument: str, for_execution: bool = False) -> dict:
             higher_timeframes[timeframe] = mt5_broker.market_snapshot(instrument, timeframe)
     except RuntimeError as error:
         raise HTTPException(status_code=503, detail=f"MT5 market data unavailable: {error}") from error
-    direction = snapshot.get("direction", "BUY")
+    strategy = snapshot.get("strategy", {})
+    direction = strategy.get("direction", snapshot.get("direction", "BUY"))
     pip_size = float(snapshot.get("pip_size", market_data.pip_sizes[instrument]))
     price = snapshot["price"]
     take_profit_pips = DEFAULT_TP_PIPS
-    stop_loss_pips = int(os.getenv("DEFAULT_STOP_LOSS_PIPS", "100"))
-    candle_signal = snapshot.get("candle_signal", {})
-    strategy = snapshot.get("strategy", {})
+    candle_signal = strategy.get("pattern", {})
+    stop_loss_price = float(strategy.get("stop_price", price))
+    take_profit_price = price + take_profit_pips * pip_size if direction == "BUY" else price - take_profit_pips * pip_size
+    risk_distance = abs(price - stop_loss_price)
+    risk_reward = (take_profit_pips * pip_size / risk_distance) if risk_distance else 0
+    news = economic_calendar.blocked(instrument)
     score = 0
-    if candle_signal.get("qualified"):
-        score += 30
-    if strategy.get("direction") == direction:
+    if strategy.get("trend") == direction:
         score += 20
-    rsi = float(strategy.get("rsi", 50))
-    momentum_allowed = 50 <= rsi <= 72 if direction == "BUY" else 28 <= rsi <= 50
-    if momentum_allowed:
-        score += 15
-    direction_aligned = candle_signal.get("direction") in (None, direction)
-    spread_allowed = snapshot["spread_pips"] <= MAX_SPREAD_PIPS
-    aligned_timeframes = [timeframe for timeframe, higher_snapshot in higher_timeframes.items() if higher_snapshot["direction"] == direction]
-    trend_confluence = len(aligned_timeframes) >= 3
-    bias_confirmed = trend_confluence and direction in ("BUY", "SELL")
-    if trend_confluence:
+    if strategy.get("signal_confirmed"):
         score += 25
-    if spread_allowed:
+    if strategy.get("level_confirmed"):
+        score += 20
+    if strategy.get("volume_ratio", 0) >= 1.2:
         score += 10
+    rsi = float(strategy.get("rsi", 50))
+    momentum_allowed = 45 <= rsi <= 70 if direction == "BUY" else 30 <= rsi <= 55
+    if momentum_allowed:
+        score += 10
+    direction_aligned = candle_signal.get("direction") == direction
+    spread_allowed = snapshot["spread_pips"] <= MAX_SPREAD_PIPS
+    aligned_timeframes = [timeframe for timeframe, higher_snapshot in higher_timeframes.items() if higher_snapshot.get("strategy", {}).get("trend") == direction]
+    trend_confluence = len(aligned_timeframes) >= 3 and all(higher_timeframes[timeframe].get("strategy", {}).get("ready", False) for timeframe in ("H1", "H4"))
+    bias_confirmed = trend_confluence and direction in ("BUY", "SELL")
+    if spread_allowed:
+        score += 5
+    policy_differential = None
+    if len(instrument) >= 6 and instrument[:3] in CENTRAL_BANK_RATES and instrument[3:6] in CENTRAL_BANK_RATES:
+        policy_differential = CENTRAL_BANK_RATES[instrument[:3]] - CENTRAL_BANK_RATES[instrument[3:6]]
+    policy_aligned = policy_differential is None or (policy_differential > 0 if direction == "BUY" else policy_differential < 0)
+    if policy_aligned and policy_differential is not None:
+        score += 5
     minimum_score = int(os.getenv("BOT_MIN_SCORE", "84"))
-    can_trade = score >= minimum_score and candle_signal.get("qualified", False) and direction_aligned and spread_allowed and trend_confluence and momentum_allowed
-    distance_tp = take_profit_pips * pip_size
-    distance_sl = stop_loss_pips * pip_size
+    can_trade = score >= minimum_score and direction_aligned and spread_allowed and trend_confluence and momentum_allowed and strategy.get("level_confirmed", False) and not strategy.get("high_volatility", False) and news["blocked"] is False and policy_aligned and risk_reward >= RISK_REWARD_RATIO
     entry_price = price
     entry_type = "MARKET"
-    trend_average = float(snapshot.get("trend_average", price))
-    pullback_gap_pips = abs(price - trend_average) / pip_size if pip_size else 0
-    if can_trade and 3 <= pullback_gap_pips <= 30 and ((direction == "BUY" and trend_average < price) or (direction == "SELL" and trend_average > price)):
-        entry_price = trend_average
-        entry_type = "LIMIT"
-    reason = f"Strategy score {score}/100: trend, momentum, impulse candle, spread, and {len(aligned_timeframes)}/4 timeframe alignment passed"
-    if not candle_signal.get("qualified", False):
-        reason = candle_signal.get("reason", "Waiting for a qualified M5 candle")
+    pattern = strategy.get("pattern", {})
+    if can_trade and pattern.get("range"):
+        entry_price = pattern["close"] - pattern["range"] * 0.5 if direction == "BUY" else pattern["close"] + pattern["range"] * 0.5
+        entry_price = round(entry_price, int(snapshot.get("digits", 5)))
+        if (direction == "BUY" and entry_price < snapshot["ask"] and entry_price > stop_loss_price) or (direction == "SELL" and entry_price > snapshot["bid"] and entry_price < stop_loss_price):
+            entry_type = "LIMIT_50_PERCENT"
+        else:
+            entry_price = price
+    entry_risk_distance = abs(entry_price - stop_loss_price)
+    take_profit_price = entry_price + take_profit_pips * pip_size if direction == "BUY" else entry_price - take_profit_pips * pip_size
+    risk_reward = (take_profit_pips * pip_size / entry_risk_distance) if entry_risk_distance else 0
+    if can_trade and risk_reward < RISK_REWARD_RATIO:
+        can_trade = False
+    stop_loss_pips = round(entry_risk_distance / pip_size, 1) if pip_size else 0
+    reason = f"50/200 EMA trend, level, {candle_signal.get('name', 'pattern')}, volume, and {len(aligned_timeframes)}/4 timeframe confluence passed"
+    if news["blocked"]:
+        reason = news["reason"]
+    elif not strategy.get("ready", False):
+        reason = strategy.get("reason", "Waiting for 205 candles for EMA200")
+    elif strategy.get("high_volatility") and not (strategy.get("bullish_breakout") or strategy.get("bearish_breakout")):
+        reason = "High-volatility move is not a confirmed level breakout"
+    elif not strategy.get("level_confirmed"):
+        reason = "Waiting for price action at support/resistance or a confirmed close beyond the level"
     elif not direction_aligned:
-        reason = "M5 candle direction does not match the trend"
-    elif not spread_allowed:
-        reason = f"Spread {snapshot['spread_pips']} pips exceeds the {MAX_SPREAD_PIPS} pip limit"
-    elif not momentum_allowed:
-        reason = f"RSI momentum filter is not aligned with {direction} ({rsi:.1f})"
+        reason = "Candlestick direction does not confirm the 50/200 EMA trend"
     elif not trend_confluence:
-        reason = f"Multi-timeframe trend confirmation is incomplete ({len(aligned_timeframes)}/4 aligned)"
-    return {"instrument": instrument, "direction": direction, "score": min(100, score), "decision": "TRADE" if can_trade else "WAIT" if for_execution else "Signal confirmed" if score >= 70 else "Waiting for M5 impulse", "entry_zone": f"{entry_price - pip_size * 6:.{5 if pip_size < 0.01 else 2}f} - {entry_price + pip_size * 6:.{5 if pip_size < 0.01 else 2}f}", "entry_price": round(entry_price, int(snapshot.get("digits", 5))), "entry_type": entry_type, "pullback_gap_pips": round(pullback_gap_pips, 1), "stop_loss": round(entry_price - distance_sl if direction == "BUY" else entry_price + distance_sl, int(snapshot.get("digits", 5))), "take_profit": round(entry_price + distance_tp if direction == "BUY" else entry_price - distance_tp, int(snapshot.get("digits", 5))), "take_profit_pips": take_profit_pips, "stop_loss_pips": stop_loss_pips, "pip_size": pip_size, "bias_confirmed": bias_confirmed, "entry_confirmed": can_trade, "confirmation": "Entry confirmed" if can_trade else "Bias confirmed" if bias_confirmed else "Waiting", "reason": reason, "market": snapshot, "timeframes": {"M5": {"direction": direction, "qualified": candle_signal.get("qualified", False)}, **{timeframe: {"direction": value["direction"], "trend_average": value["trend_average"]} for timeframe, value in higher_timeframes.items()}}, "timeframe_confluence": {"aligned": aligned_timeframes, "aligned_count": len(aligned_timeframes), "required": 3}, "analyzed_at": datetime.now(UTC).isoformat()}
+        reason = f"Higher-timeframe EMA trend confirmation is incomplete ({len(aligned_timeframes)}/4 aligned)"
+    elif not momentum_allowed:
+        reason = f"Momentum filter rejects trading against strong RSI momentum ({rsi:.1f})"
+    elif risk_reward < RISK_REWARD_RATIO:
+        reason = f"Risk/reward is {risk_reward:.2f}:1, below configured {RISK_REWARD_RATIO:.2f}:1 minimum"
+    return {"instrument": instrument, "direction": direction, "score": min(100, score), "decision": "TRADE" if can_trade else "WAIT" if for_execution else "Signal confirmed" if score >= 70 else "Waiting for confluence", "entry_zone": f"{entry_price - pip_size * 6:.{5 if pip_size < 0.01 else 2}f} - {entry_price + pip_size * 6:.{5 if pip_size < 0.01 else 2}f}", "entry_price": round(entry_price, int(snapshot.get("digits", 5))), "entry_type": entry_type, "stop_loss": round(stop_loss_price, int(snapshot.get("digits", 5))), "take_profit": round(take_profit_price, int(snapshot.get("digits", 5))), "take_profit_pips": take_profit_pips, "stop_loss_pips": stop_loss_pips, "risk_percent": RISK_PERCENT, "risk_reward": round(risk_reward, 2), "risk_reward_required": RISK_REWARD_RATIO, "pip_size": pip_size, "bias_confirmed": bias_confirmed, "entry_confirmed": can_trade, "confirmation": "Entry confirmed" if can_trade else "Bias confirmed" if bias_confirmed else "Waiting", "reason": reason, "news": news, "policy_differential": policy_differential, "market": snapshot, "timeframes": {"M5": {"direction": direction, "trend": strategy.get("trend"), "pattern": candle_signal.get("name")}, **{timeframe: {"direction": value.get("direction"), "trend": value.get("strategy", {}).get("trend"), "ema50": value.get("strategy", {}).get("ema50"), "ema200": value.get("strategy", {}).get("ema200")} for timeframe, value in higher_timeframes.items()}}, "timeframe_confluence": {"aligned": aligned_timeframes, "aligned_count": len(aligned_timeframes), "required": 3}, "analyzed_at": datetime.now(UTC).isoformat()}
 
 
 def execute_bot_trade(analysis: dict) -> dict:
@@ -163,11 +199,11 @@ def execute_bot_trade(analysis: dict) -> dict:
     positions = mt5_broker.positions()
     if instrument_has_open_position(request.instrument, positions):
         raise RuntimeError(f"{request.instrument} already has an open MT5 position")
-    if analysis.get("entry_type") == "LIMIT":
-        orders = mt5_broker.open_limit_orders(request.instrument, request.direction, request.positions, analysis["entry_price"], request.take_profit_pips, request.stop_loss_pips)
+    if analysis.get("entry_type") == "LIMIT_50_PERCENT":
+        orders = mt5_broker.open_limit_orders(request.instrument, request.direction, request.positions, analysis["entry_price"], request.take_profit_pips, request.stop_loss_pips, analysis["risk_percent"], analysis["stop_loss"], analysis["take_profit"])
     else:
-        orders = mt5_broker.open_market_orders(request.instrument, request.direction, request.positions, request.take_profit_pips, request.stop_loss_pips)
-    return {"mode": "live", "status": "OPEN", "entry_type": analysis.get("entry_type", "MARKET"), "target_pips": DEFAULT_TP_PIPS, "orders": orders, "opened_at": datetime.now(UTC).isoformat()}
+        orders = mt5_broker.open_market_orders(request.instrument, request.direction, request.positions, request.take_profit_pips, request.stop_loss_pips, analysis["risk_percent"], analysis["stop_loss"], analysis["take_profit"])
+    return {"mode": "live", "status": "OPEN", "entry_type": analysis.get("entry_type", "MARKET"), "target_pips": DEFAULT_TP_PIPS, "risk_percent": analysis["risk_percent"], "risk_reward": analysis["risk_reward"], "orders": orders, "opened_at": datetime.now(UTC).isoformat()}
 
 
 def bot_analyze() -> dict:
@@ -212,12 +248,17 @@ def startup() -> None:
 
 @app.get("/api/health")
 def health() -> dict:
-    return {"status": "ok", "mode": "live", "live_execution_enabled": LIVE_TRADING_ENABLED and LIVE_TRADING_CONFIRMATION, "mt5": mt5_broker.status(), "database": str(DATABASE_PATH)}
+    return {"status": "ok", "mode": "live", "live_execution_enabled": LIVE_TRADING_ENABLED and LIVE_TRADING_CONFIRMATION, "risk_percent": RISK_PERCENT, "risk_reward_ratio": RISK_REWARD_RATIO, "economic_calendar": economic_calendar.status(), "mt5": mt5_broker.status(), "database": str(DATABASE_PATH)}
 
 
 @app.get("/api/broker/mt5/status")
 def mt5_status() -> dict:
     return mt5_broker.status()
+
+
+@app.get("/api/strategy/config")
+def strategy_config() -> dict:
+    return {"target_pips": DEFAULT_TP_PIPS, "risk_percent": RISK_PERCENT, "risk_reward_ratio": RISK_REWARD_RATIO, "ema_fast": 50, "ema_slow": 200, "news_blackout_before_minutes": economic_calendar.before_minutes, "news_blackout_after_minutes": economic_calendar.after_minutes, "news_fail_closed": economic_calendar.fail_closed, "central_bank_rates_configured": bool(CENTRAL_BANK_RATES)}
 
 
 @app.get("/api/analysis/{instrument}")

@@ -4,6 +4,8 @@ import os
 from dataclasses import dataclass
 from typing import Any
 
+from backend.app.strategy import analyze_rates
+
 try:
     import MetaTrader5 as mt5
 except ImportError:
@@ -134,20 +136,36 @@ class MT5Adapter:
             }.get(timeframe.upper())
             if timeframe_value is None:
                 raise RuntimeError(f"Unsupported MT5 timeframe: {timeframe}")
-            rates = mt5.copy_rates_from_pos(symbol, timeframe_value, 0, 32)
+            rates = mt5.copy_rates_from_pos(symbol, timeframe_value, 0, 260)
             closes = [float(rate["close"]) for rate in rates] if rates is not None else []
             average = sum(closes[:-1]) / len(closes[:-1]) if len(closes) > 1 else float(tick.bid)
-            strategy = self._strategy_snapshot(rates, float(tick.bid))
-            direction = strategy["direction"]
-            candle_signal = self._candle_signal(rates)
             point = symbol_info.point
             pip_size = point * 10 if symbol_info.digits in (3, 5) else point
+            strategy = analyze_rates(rates, float(tick.bid), pip_size)
+            direction = strategy.get("direction", "BUY")
+            candle_signal = strategy.get("pattern", {})
             spread_pips = (tick.ask - tick.bid) / pip_size if pip_size else 0
-            return {"instrument": instrument, "symbol": symbol, "price": float(tick.ask if direction == "BUY" else tick.bid), "bid": float(tick.bid), "ask": float(tick.ask), "spread_pips": round(spread_pips, 2), "provider": "exness-mt5", "direction": direction, "trend_average": average, "pip_size": pip_size, "digits": symbol_info.digits, "timeframe": timeframe.upper(), "candle_signal": candle_signal, "strategy": strategy}
+            return {"instrument": instrument, "symbol": symbol, "price": float(tick.ask if direction == "BUY" else tick.bid), "bid": float(tick.bid), "ask": float(tick.ask), "spread_pips": round(spread_pips, 2), "provider": "exness-mt5", "direction": direction, "trend_average": average, "pip_size": pip_size, "digits": symbol_info.digits, "volume_min": symbol_info.volume_min, "volume_max": symbol_info.volume_max, "volume_step": symbol_info.volume_step, "trade_tick_value": symbol_info.trade_tick_value, "trade_tick_size": symbol_info.trade_tick_size, "stops_level_points": symbol_info.trade_stops_level, "timeframe": timeframe.upper(), "candle_signal": candle_signal, "strategy": strategy}
         finally:
             self.disconnect()
 
-    def open_market_orders(self, instrument: str, direction: str, positions: int, take_profit_pips: int, stop_loss_pips: int) -> list[dict[str, Any]]:
+    def _risk_volume(self, symbol: str, direction: str, entry_price: float, stop_loss: float, risk_percent: float, positions: int, symbol_info: Any) -> float:
+        account = mt5.account_info()
+        if account is None or risk_percent <= 0:
+            raise RuntimeError("MT5 account equity is required for risk-based volume sizing")
+        order_type = mt5.ORDER_TYPE_BUY if direction == "BUY" else mt5.ORDER_TYPE_SELL
+        loss_per_lot = abs(float(mt5.order_calc_profit(order_type, symbol, 1.0, entry_price, stop_loss) or 0))
+        if loss_per_lot <= 0:
+            raise RuntimeError("MT5 could not calculate the stop-loss value for risk sizing")
+        risk_money_per_position = float(account.equity) * (risk_percent / 100) / positions
+        raw_volume = risk_money_per_position / loss_per_lot
+        step = symbol_info.volume_step or 0.01
+        volume = (raw_volume // step) * step
+        if volume < symbol_info.volume_min:
+            raise RuntimeError(f"Minimum volume {symbol_info.volume_min} would exceed the configured {risk_percent}% account risk")
+        return round(min(volume, symbol_info.volume_max), 2)
+
+    def open_market_orders(self, instrument: str, direction: str, positions: int, take_profit_pips: int, stop_loss_pips: int, risk_percent: float = 1.0, stop_loss_price: float | None = None, take_profit_price: float | None = None) -> list[dict[str, Any]]:
         self.connect()
         if mt5.account_info() is None:
             self.disconnect()
@@ -164,8 +182,9 @@ class MT5Adapter:
         price = tick.ask if is_buy else tick.bid
         point = symbol_info.point
         pip_size = point * 10 if symbol_info.digits in (3, 5) else point
-        take_profit = price + take_profit_pips * pip_size if is_buy else price - take_profit_pips * pip_size
-        stop_loss = price - stop_loss_pips * pip_size if is_buy else price + stop_loss_pips * pip_size
+        take_profit = take_profit_price or (price + take_profit_pips * pip_size if is_buy else price - take_profit_pips * pip_size)
+        stop_loss = stop_loss_price or (price - stop_loss_pips * pip_size if is_buy else price + stop_loss_pips * pip_size)
+        volume = self._risk_volume(symbol, direction, price, stop_loss, risk_percent, positions, symbol_info)
         order_type = mt5.ORDER_TYPE_BUY if is_buy else mt5.ORDER_TYPE_SELL
         results = []
 
@@ -174,7 +193,7 @@ class MT5Adapter:
                 request = {
                     "action": mt5.TRADE_ACTION_DEAL,
                     "symbol": symbol,
-                    "volume": self.config.volume_per_position,
+                    "volume": volume,
                     "type": order_type,
                     "price": price,
                     "sl": round(stop_loss, symbol_info.digits),
@@ -196,7 +215,7 @@ class MT5Adapter:
             self.disconnect()
         return results
 
-    def open_limit_orders(self, instrument: str, direction: str, positions: int, entry_price: float, take_profit_pips: int, stop_loss_pips: int) -> list[dict[str, Any]]:
+    def open_limit_orders(self, instrument: str, direction: str, positions: int, entry_price: float, take_profit_pips: int, stop_loss_pips: int, risk_percent: float = 1.0, stop_loss_price: float | None = None, take_profit_price: float | None = None) -> list[dict[str, Any]]:
         self.connect()
         if mt5.account_info() is None:
             self.disconnect()
@@ -213,8 +232,9 @@ class MT5Adapter:
             raise RuntimeError("Buy limit entry must be below the current ask")
         if not is_buy and entry_price <= tick.bid:
             raise RuntimeError("Sell limit entry must be above the current bid")
-        take_profit = entry_price + take_profit_pips * pip_size if is_buy else entry_price - take_profit_pips * pip_size
-        stop_loss = entry_price - stop_loss_pips * pip_size if is_buy else entry_price + stop_loss_pips * pip_size
+        take_profit = take_profit_price or (entry_price + take_profit_pips * pip_size if is_buy else entry_price - take_profit_pips * pip_size)
+        stop_loss = stop_loss_price or (entry_price - stop_loss_pips * pip_size if is_buy else entry_price + stop_loss_pips * pip_size)
+        volume = self._risk_volume(symbol, direction, entry_price, stop_loss, risk_percent, positions, symbol_info)
         order_type = mt5.ORDER_TYPE_BUY_LIMIT if is_buy else mt5.ORDER_TYPE_SELL_LIMIT
         results = []
         try:
@@ -222,7 +242,7 @@ class MT5Adapter:
                 request = {
                     "action": mt5.TRADE_ACTION_PENDING,
                     "symbol": symbol,
-                    "volume": self.config.volume_per_position,
+                    "volume": volume,
                     "type": order_type,
                     "price": round(entry_price, symbol_info.digits),
                     "sl": round(stop_loss, symbol_info.digits),
@@ -243,49 +263,6 @@ class MT5Adapter:
         finally:
             self.disconnect()
         return results
-
-    @staticmethod
-    def _candle_signal(rates: Any) -> dict[str, Any]:
-        if rates is None or len(rates) < 8:
-            return {"qualified": False, "reason": "Not enough closed M5 candles"}
-        closed = rates[-2]
-        recent = rates[-9:-2]
-        body = abs(float(closed["close"]) - float(closed["open"]))
-        candle_range = float(closed["high"]) - float(closed["low"])
-        average_body = sum(abs(float(item["close"]) - float(item["open"])) for item in recent) / len(recent)
-        direction = "BUY" if float(closed["close"]) > float(closed["open"]) else "SELL" if float(closed["close"]) < float(closed["open"]) else "FLAT"
-        body_ratio = body / candle_range if candle_range else 0
-        impulse_ratio = body / average_body if average_body else 0
-        qualified = direction != "FLAT" and body_ratio >= 0.6 and impulse_ratio >= 1.5
-        return {"qualified": qualified, "direction": direction, "body": body, "range": candle_range, "body_ratio": round(body_ratio, 3), "impulse_ratio": round(impulse_ratio, 2), "reason": "Closed M5 impulse candle confirmed" if qualified else "Waiting for a long M5 impulse candle"}
-
-    @staticmethod
-    def _strategy_snapshot(rates: Any, current_price: float) -> dict[str, Any]:
-        if rates is None or len(rates) < 22:
-            return {"direction": "BUY" if current_price >= 0 else "SELL", "ema_fast": current_price, "ema_slow": current_price, "rsi": 50.0, "atr": 0.0, "recent_high": current_price, "recent_low": current_price}
-        closed = rates[:-1]
-        closes = [float(rate["close"]) for rate in closed]
-        highs = [float(rate["high"]) for rate in closed]
-        lows = [float(rate["low"]) for rate in closed]
-
-        def ema(values: list[float], period: int) -> float:
-            weight = 2 / (period + 1)
-            result = values[0]
-            for value in values[1:]:
-                result = value * weight + result * (1 - weight)
-            return result
-
-        gains = [max(closes[index] - closes[index - 1], 0) for index in range(1, len(closes))]
-        losses = [max(closes[index - 1] - closes[index], 0) for index in range(1, len(closes))]
-        average_gain = sum(gains[-14:]) / 14
-        average_loss = sum(losses[-14:]) / 14
-        rsi = 100 if average_loss == 0 else 100 - (100 / (1 + average_gain / average_loss))
-        ranges = [highs[index] - lows[index] for index in range(len(closed))]
-        atr = sum(ranges[-14:]) / 14
-        ema_fast = ema(closes[-12:], 9)
-        ema_slow = ema(closes, 21)
-        direction = "BUY" if ema_fast > ema_slow and current_price >= ema_fast else "SELL" if ema_fast < ema_slow and current_price <= ema_fast else "BUY" if current_price >= ema_slow else "SELL"
-        return {"direction": direction, "ema_fast": ema_fast, "ema_slow": ema_slow, "rsi": round(rsi, 2), "atr": atr, "recent_high": max(highs[-20:]), "recent_low": min(lows[-20:])}
 
     @staticmethod
     def _account_payload(info: Any) -> dict[str, Any]:

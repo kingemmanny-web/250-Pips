@@ -12,6 +12,8 @@ From the project root:
 
 The API runs at `http://127.0.0.1:8000`. Interactive API docs are available at `http://127.0.0.1:8000/docs`.
 
+The frontend uses `http://127.0.0.1:8000` during local Vite development. For a deployed frontend, set the Vercel environment variable `VITE_API_BASE_URL` to the public backend origin, without `/api`. Set the backend variable `FRONTEND_ORIGINS` to `https://250pips.vercel.app`, then redeploy both services.
+
 ## Endpoints
 
 - `GET /api/health` - service status and live-execution flag
@@ -45,4 +47,6 @@ The MT5 adapter remains fail-closed. Live orders require `TRADING_MODE=live`, `L
 
 Bot scheduling uses `BOT_INTERVAL_SECONDS`, `BOT_MIN_SCORE`, `BOT_INSTRUMENT`, and `BOT_AUTOSTART`. The bot starts only when live execution, explicit confirmation, and MT5 credentials are all present.
 
-Entries require agreement between the EMA trend, RSI momentum, the latest closed M5 impulse candle, spread, and at least three higher-timeframe directions. The bot uses the broker symbol's actual pip size, so the target is exactly 250 pips (not a raw MT5 point count). When a validated pullback to the trend average is 3-30 pips away, it submits a buy/sell limit order; otherwise it enters at market. Existing positions and 250 Pips pending orders are excluded from rescans. These filters are measurable conditions, not a guarantee of profit or of a 250-pip move.
+The strategy now uses the book's confluence model: 50/200 EMA trend direction, top-down H1/H4/M15 alignment, horizontal support/resistance zones, confirmed pin/engulfing/inside-bar price action, volume-confirmed breakouts, and momentum/volatility filters. Entries use a 50% signal-candle pullback limit when valid; otherwise a confirmed close can enter at market. Wick-only breaks and high-volatility moves without confirmation are rejected.
+
+Risk is calculated from live MT5 equity and the actual structural stop. `RISK_PERCENT` is capped between 1% and 2%, every order includes a stop, and `RISK_REWARD_RATIO` defaults to 2:1. The fixed bot target remains exactly 250 pips using the broker symbol's pip size. The economic-calendar adapter caches high-impact events and blocks the configured blackout window; `NEWS_FAIL_CLOSED=true` prevents trading if the calendar cannot be read. Optional `CENTRAL_BANK_RATES` JSON adds a policy-rate differential bias check. These filters are measurable conditions, not a guarantee of profit or of a 250-pip move.

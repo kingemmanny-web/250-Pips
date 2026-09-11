@@ -20,7 +20,7 @@ const tradingViewSymbols: Record<string, string> = {
   BTCUSD: 'COINBASE:BTCUSD',
 }
 const scanInstruments = Object.keys(tradingViewSymbols)
-const API_BASE = 'http://127.0.0.1:8000/api'
+const API_BASE = (import.meta.env.VITE_API_BASE_URL || (import.meta.env.DEV ? 'http://127.0.0.1:8000' : window.location.origin)).replace(/\/$/, '') + '/api'
 
 type LiveAccount = { login: number; server: string; currency: string; balance: number; equity: number; margin_free: number }
 type LivePosition = { ticket: number; symbol: string; direction: 'BUY' | 'SELL'; volume: number; price_open: number; price_current: number; profit: number; stop_loss: number; take_profit: number; opened_at: number }
