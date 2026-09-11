@@ -20,7 +20,9 @@ const tradingViewSymbols: Record<string, string> = {
   BTCUSD: 'COINBASE:BTCUSD',
 }
 const scanInstruments = Object.keys(tradingViewSymbols)
-const API_BASE = (import.meta.env.VITE_API_BASE_URL || (import.meta.env.DEV ? 'http://127.0.0.1:8000' : window.location.origin)).replace(/\/$/, '') + '/api'
+const configuredApiOrigin = import.meta.env.VITE_API_BASE_URL?.trim()
+const API_BASE = (configuredApiOrigin || (import.meta.env.DEV ? 'http://127.0.0.1:8000' : window.location.origin)).replace(/\/$/, '') + '/api'
+const API_CONFIGURATION_ERROR = !import.meta.env.DEV && !configuredApiOrigin
 
 type LiveAccount = { login: number; server: string; currency: string; balance: number; equity: number; margin_free: number }
 type LivePosition = { ticket: number; symbol: string; direction: 'BUY' | 'SELL'; volume: number; price_open: number; price_current: number; profit: number; stop_loss: number; take_profit: number; opened_at: number }
@@ -184,6 +186,7 @@ function App() {
     event.preventDefault()
     setLinkError('')
     try {
+      if (API_CONFIGURATION_ERROR) throw new Error('The deployed app is missing VITE_API_BASE_URL. Configure it with the public FastAPI backend URL in Vercel, then redeploy.')
       const response = await fetch(`${API_BASE}/broker/link`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ broker, account_id: accountId, server }) })
       const result = await response.json().catch(() => null) as { detail?: string | { message?: string } } | null
       if (!response.ok) {
@@ -200,6 +203,7 @@ function App() {
   const toggleTrading = async () => {
     setBotError('')
     try {
+      if (API_CONFIGURATION_ERROR) throw new Error('The deployed app is missing VITE_API_BASE_URL. Configure it with the public FastAPI backend URL in Vercel, then redeploy.')
       const endpoint = botRunning ? 'stop' : 'start'
       const response = await fetch(`${API_BASE}/bot/${endpoint}`, { method: 'POST', headers: { 'Content-Type': 'application/json' } })
       const result = await response.json()
