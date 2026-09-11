@@ -151,10 +151,6 @@ function App() {
         setBroker(account.linked_broker.broker)
         setAccountId(account.linked_broker.account_id)
         setServer(account.linked_broker.server)
-      } else {
-        setConnected(false)
-        setAccountId('')
-        setServer('')
       }
       if (account.live_account && !account.linked_broker) {
         setConnected(true)
@@ -189,7 +185,11 @@ function App() {
     setLinkError('')
     try {
       const response = await fetch(`${API_BASE}/broker/link`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ broker, account_id: accountId, server }) })
-      if (!response.ok) throw new Error('The backend rejected this broker account.')
+      const result = await response.json().catch(() => null) as { detail?: string | { message?: string } } | null
+      if (!response.ok) {
+        const detail = typeof result?.detail === 'string' ? result.detail : result?.detail?.message
+        throw new Error(detail || `Broker connection failed (${response.status}). Open MT5, log into this account, and try again.`)
+      }
       setConnected(true)
       setShowBroker(false)
     } catch (error) {

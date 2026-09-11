@@ -1,8 +1,19 @@
 $ErrorActionPreference = 'Stop'
 
-function Set-UserSetting($name, $value) {
-    [Environment]::SetEnvironmentVariable($name, $value, 'User')
-    Set-Item "Env:$name" $value
+function Set-EnvFileSetting($path, $name, $value) {
+    $lines = if (Test-Path $path) { @(Get-Content $path) } else { @() }
+    $pattern = '^' + [regex]::Escape($name) + '='
+    $found = $false
+    $updated = foreach ($line in $lines) {
+        if ($line -match $pattern) {
+            $found = $true
+            "$name=$value"
+        } else {
+            $line
+        }
+    }
+    if (-not $found) { $updated += "$name=$value" }
+    Set-Content -Path $path -Value $updated -Encoding utf8
 }
 
 Write-Host 'Exness MT5 setup. Use a demo account first.'
@@ -21,16 +32,17 @@ try {
 }
 
 if ([string]::IsNullOrWhiteSpace($volume)) { $volume = '0.01' }
-Set-UserSetting 'BROKER' 'mt5'
-Set-UserSetting 'LIVE_TRADING_ENABLED' 'false'
-Set-UserSetting 'LIVE_TRADING_CONFIRMATION' ''
-Set-UserSetting 'MT5_LOGIN' $login
-Set-UserSetting 'MT5_PASSWORD' $password
-Set-UserSetting 'MT5_SERVER' $server
-Set-UserSetting 'MT5_PATH' $path
-Set-UserSetting 'MT5_SYMBOL_SUFFIX' $suffix
-Set-UserSetting 'MT5_VOLUME_PER_POSITION' $volume
+$envFile = Join-Path $PSScriptRoot '.env'
+Set-EnvFileSetting $envFile 'BROKER' 'mt5'
+Set-EnvFileSetting $envFile 'LIVE_TRADING_ENABLED' 'false'
+Set-EnvFileSetting $envFile 'LIVE_TRADING_CONFIRMATION' ''
+Set-EnvFileSetting $envFile 'MT5_LOGIN' $login
+Set-EnvFileSetting $envFile 'MT5_PASSWORD' $password
+Set-EnvFileSetting $envFile 'MT5_SERVER' $server
+Set-EnvFileSetting $envFile 'MT5_PATH' $path
+Set-EnvFileSetting $envFile 'MT5_SYMBOL_SUFFIX' $suffix
+Set-EnvFileSetting $envFile 'MT5_VOLUME_PER_POSITION' $volume
 
 Write-Host ''
-Write-Host 'Exness MT5 settings saved to your Windows user environment.' -ForegroundColor Green
+Write-Host 'Exness MT5 settings saved to the project .env file.' -ForegroundColor Green
 Write-Host 'Live trading remains disabled. Start the backend with .\run-backend.ps1 and check /api/broker/mt5/status.'

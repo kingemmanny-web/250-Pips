@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from backend.app.bot_controller import BotController
-from backend.app.mt5_adapter import MT5Adapter
+from backend.app.mt5_adapter import MT5Adapter, MT5Config
 from backend.app.news_calendar import EconomicCalendar
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -34,7 +34,7 @@ FRONTEND_ORIGINS = [origin.strip() for origin in os.getenv("FRONTEND_ORIGINS", "
 DEFAULT_FRONTEND_ORIGINS = ["https://250pips.vercel.app", "http://127.0.0.1:4173", "http://127.0.0.1:4174", "http://127.0.0.1:5173", "http://127.0.0.1:5174", "http://localhost:4173", "http://localhost:4174", "http://localhost:5173", "http://localhost:5174"]
 
 app = FastAPI(title="250 Pips Trading API", version="0.1.0")
-app.add_middleware(CORSMiddleware, allow_origins=DEFAULT_FRONTEND_ORIGINS + FRONTEND_ORIGINS, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(CORSMiddleware, allow_origins=DEFAULT_FRONTEND_ORIGINS + FRONTEND_ORIGINS, allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?", allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 
 class CycleRequest(BaseModel):
@@ -65,7 +65,8 @@ class MarketConfig:
         raise RuntimeError(f"MT5 market data is required for {instrument}")
 
 market_data = MarketConfig()
-mt5_broker = MT5Adapter()
+mt5_brokers = [MT5Adapter(profile) for profile in MT5Config.profiles_from_environment()]
+mt5_broker = mt5_brokers[0]
 economic_calendar = EconomicCalendar()
 try:
     CENTRAL_BANK_RATES = {key.upper(): float(value) for key, value in json.loads(os.getenv("CENTRAL_BANK_RATES", "{} ")).items()}
@@ -75,21 +76,42 @@ scan_lock = threading.Lock()
 scan_index = 0
 
 
-def instrument_has_open_position(instrument: str, positions: list[dict] | None = None) -> bool:
-    open_positions = positions if positions is not None else mt5_broker.positions()
+def instrument_has_open_position(instrument: str, positions: list[dict] | None = None, broker: MT5Adapter | None = None) -> bool:
+    active_broker = broker or mt5_broker
+    open_positions = positions if positions is not None else active_broker.positions()
     normalized = instrument.upper()
     if any(position["symbol"].upper().startswith(normalized) for position in open_positions):
         return True
-    pending_orders = mt5_broker.pending_orders()
+    pending_orders = active_broker.pending_orders()
     return any(order["symbol"].upper().startswith(normalized) for order in pending_orders)
+
+
+def all_live_positions() -> list[dict]:
+    positions = []
+    for broker in mt5_brokers:
+        try:
+            positions.extend([{**position, "account_id": broker.config.account_id} for position in broker.positions()])
+        except RuntimeError:
+            continue
+    return positions
+
+
+def any_account_has_open_position(instrument: str) -> bool:
+    for broker in mt5_brokers:
+        try:
+            if instrument_has_open_position(instrument, broker=broker):
+                return True
+        except RuntimeError:
+            continue
+    return False
 
 
 def analyze_market() -> dict:
     global scan_index
-    positions = mt5_broker.positions()
+    positions = all_live_positions()
     running_instruments = {
         instrument for instrument in SCAN_INSTRUMENTS
-        if instrument_has_open_position(instrument, positions)
+        if any(position["symbol"].upper().startswith(instrument) for position in positions)
     }
     with scan_lock:
         available = [instrument for instrument in SCAN_INSTRUMENTS if instrument not in running_instruments]
@@ -196,14 +218,24 @@ def execute_bot_trade(analysis: dict) -> dict:
     request = CycleRequest(instrument=analysis["instrument"], direction=analysis["direction"], score=analysis["score"], positions=min(MAX_POSITIONS_PER_CYCLE, int(os.getenv("BOT_POSITIONS", "4"))), take_profit_pips=analysis["take_profit_pips"], stop_loss_pips=analysis["stop_loss_pips"])
     if not LIVE_TRADING_ENABLED or not LIVE_TRADING_CONFIRMATION:
         raise RuntimeError("Live execution is disabled by the safety gate")
-    positions = mt5_broker.positions()
-    if instrument_has_open_position(request.instrument, positions):
-        raise RuntimeError(f"{request.instrument} already has an open MT5 position")
-    if analysis.get("entry_type") == "LIMIT_50_PERCENT":
-        orders = mt5_broker.open_limit_orders(request.instrument, request.direction, request.positions, analysis["entry_price"], request.take_profit_pips, request.stop_loss_pips, analysis["risk_percent"], analysis["stop_loss"], analysis["take_profit"])
-    else:
-        orders = mt5_broker.open_market_orders(request.instrument, request.direction, request.positions, request.take_profit_pips, request.stop_loss_pips, analysis["risk_percent"], analysis["stop_loss"], analysis["take_profit"])
-    return {"mode": "live", "status": "OPEN", "entry_type": analysis.get("entry_type", "MARKET"), "target_pips": DEFAULT_TP_PIPS, "risk_percent": analysis["risk_percent"], "risk_reward": analysis["risk_reward"], "orders": orders, "opened_at": datetime.now(UTC).isoformat()}
+    account_results = []
+    account_errors = []
+    for broker in mt5_brokers:
+        try:
+            positions = broker.positions()
+            if instrument_has_open_position(request.instrument, positions, broker):
+                account_results.append({"account_id": broker.config.account_id, "status": "SKIPPED", "reason": f"{request.instrument} already has an open position or pending order"})
+                continue
+            if analysis.get("entry_type") == "LIMIT_50_PERCENT":
+                orders = broker.open_limit_orders(request.instrument, request.direction, request.positions, analysis["entry_price"], request.take_profit_pips, request.stop_loss_pips, analysis["risk_percent"], analysis["stop_loss"], analysis["take_profit"])
+            else:
+                orders = broker.open_market_orders(request.instrument, request.direction, request.positions, request.take_profit_pips, request.stop_loss_pips, analysis["risk_percent"], analysis["stop_loss"], analysis["take_profit"])
+            account_results.append({"account_id": broker.config.account_id, "status": "OPEN", "orders": orders})
+        except RuntimeError as error:
+            account_errors.append({"account_id": broker.config.account_id, "error": str(error)})
+    if not any(result["status"] == "OPEN" for result in account_results):
+        raise RuntimeError(f"No MT5 account accepted the trade. Account errors: {account_errors or account_results}")
+    return {"mode": "live", "status": "OPEN", "entry_type": analysis.get("entry_type", "MARKET"), "target_pips": DEFAULT_TP_PIPS, "risk_percent": analysis["risk_percent"], "risk_reward": analysis["risk_reward"], "accounts": account_results, "account_errors": account_errors, "opened_at": datetime.now(UTC).isoformat()}
 
 
 def bot_analyze() -> dict:
@@ -242,38 +274,43 @@ def initialize_database() -> None:
 @app.on_event("startup")
 def startup() -> None:
     initialize_database()
-    if BOT_AUTOSTART and LIVE_TRADING_ENABLED and LIVE_TRADING_CONFIRMATION and mt5_broker.status().get("connected"):
+    if BOT_AUTOSTART and LIVE_TRADING_ENABLED and LIVE_TRADING_CONFIRMATION and any(broker.status().get("connected") for broker in mt5_brokers):
         bot.start("live")
 
 
 @app.get("/api/health")
 def health() -> dict:
-    return {"status": "ok", "mode": "live", "live_execution_enabled": LIVE_TRADING_ENABLED and LIVE_TRADING_CONFIRMATION, "risk_percent": RISK_PERCENT, "risk_reward_ratio": RISK_REWARD_RATIO, "economic_calendar": economic_calendar.status(), "mt5": mt5_broker.status(), "database": str(DATABASE_PATH)}
+    account_statuses = [broker.status() for broker in mt5_brokers]
+    return {"status": "ok", "mode": "live", "live_execution_enabled": LIVE_TRADING_ENABLED and LIVE_TRADING_CONFIRMATION, "risk_percent": RISK_PERCENT, "risk_reward_ratio": RISK_REWARD_RATIO, "economic_calendar": economic_calendar.status(), "mt5": account_statuses[0], "mt5_accounts": account_statuses, "database": str(DATABASE_PATH)}
 
 
 @app.get("/api/broker/mt5/status")
 def mt5_status() -> dict:
-    return mt5_broker.status()
+    statuses = [broker.status() for broker in mt5_brokers]
+    return {"accounts": statuses, "connected_accounts": sum(1 for status in statuses if status.get("connected"))}
 
 
 @app.get("/api/strategy/config")
 def strategy_config() -> dict:
-    return {"target_pips": DEFAULT_TP_PIPS, "risk_percent": RISK_PERCENT, "risk_reward_ratio": RISK_REWARD_RATIO, "ema_fast": 50, "ema_slow": 200, "news_blackout_before_minutes": economic_calendar.before_minutes, "news_blackout_after_minutes": economic_calendar.after_minutes, "news_fail_closed": economic_calendar.fail_closed, "central_bank_rates_configured": bool(CENTRAL_BANK_RATES)}
+    return {"target_pips": DEFAULT_TP_PIPS, "risk_percent": RISK_PERCENT, "risk_reward_ratio": RISK_REWARD_RATIO, "ema_fast": 50, "ema_slow": 200, "news_blackout_before_minutes": economic_calendar.before_minutes, "news_blackout_after_minutes": economic_calendar.after_minutes, "news_fail_closed": economic_calendar.fail_closed, "central_bank_rates_configured": bool(CENTRAL_BANK_RATES), "account_count": len(mt5_brokers), "account_ids": [broker.config.account_id for broker in mt5_brokers]}
 
 
 @app.get("/api/analysis/{instrument}")
 def instrument_analysis(instrument: str) -> dict:
-    if instrument_has_open_position(instrument):
-        return {
-            "instrument": instrument.upper(),
-            "decision": "WAIT",
-            "entry_confirmed": False,
-            "bias_confirmed": False,
-            "confirmation": "Position already open",
-            "reason": f"{instrument.upper()} is excluded from analysis until its current MT5 position closes.",
-            "analyzed_at": datetime.now(UTC).isoformat(),
-        }
-    return analyze_instrument(instrument)
+    try:
+        if any_account_has_open_position(instrument):
+            return {
+                "instrument": instrument.upper(),
+                "decision": "WAIT",
+                "entry_confirmed": False,
+                "bias_confirmed": False,
+                "confirmation": "Position already open",
+                "reason": f"{instrument.upper()} is excluded from analysis until its current MT5 position closes.",
+                "analyzed_at": datetime.now(UTC).isoformat(),
+            }
+        return analyze_instrument(instrument)
+    except RuntimeError as error:
+        raise HTTPException(status_code=503, detail=f"MT5 account unavailable: {error}") from error
 
 
 @app.get("/api/bot/status")
@@ -285,7 +322,7 @@ def bot_status() -> dict:
 def start_bot() -> dict:
     if not LIVE_TRADING_ENABLED or not LIVE_TRADING_CONFIRMATION:
         raise HTTPException(status_code=403, detail="Live bot execution requires LIVE_TRADING_ENABLED=true and LIVE_TRADING_CONFIRMATION=I_UNDERSTAND_REAL_MONEY")
-    if not mt5_broker.status().get("connected"):
+    if not any(broker.status().get("connected") for broker in mt5_brokers):
         raise HTTPException(status_code=503, detail="Live bot execution requires an active MT5 terminal account")
     return bot.start("live")
 
@@ -300,14 +337,10 @@ def account() -> dict:
     connection = sqlite3.connect(DATABASE_PATH)
     row = connection.execute("SELECT broker, account_id, server, mode FROM broker_accounts ORDER BY id DESC LIMIT 1").fetchone()
     connection.close()
-    mt5_snapshot = mt5_broker.status()
-    live_positions = []
-    positions_error = None
-    if mt5_snapshot.get("connected"):
-        try:
-            live_positions = mt5_broker.positions()
-        except RuntimeError as error:
-            positions_error = str(error)
+    account_statuses = [broker.status() for broker in mt5_brokers]
+    mt5_snapshot = account_statuses[0]
+    live_positions = all_live_positions()
+    positions_error = "; ".join(status.get("error", "MT5 account unavailable") for status in account_statuses if status.get("error")) or None
     live_account = mt5_snapshot.get("account")
     active_link = None
     if live_account is not None:
@@ -320,17 +353,16 @@ def account() -> dict:
             "mode": "live",
             "verified": True,
         }
-    return {"mode": "live", "live_account": live_account, "live_positions": live_positions, "positions_error": positions_error, "linked_broker": active_link, "live_execution_enabled": LIVE_TRADING_ENABLED and LIVE_TRADING_CONFIRMATION}
+    return {"mode": "live", "live_account": live_account, "live_accounts": [status.get("account") for status in account_statuses if status.get("account")], "live_positions": live_positions, "positions_error": positions_error, "linked_broker": active_link, "live_execution_enabled": LIVE_TRADING_ENABLED and LIVE_TRADING_CONFIRMATION}
 
 
 @app.post("/api/broker/link")
 def link_broker(request: BrokerLinkRequest) -> dict:
-    current = mt5_broker.status()
-    account_info = current.get("account")
-    if not current.get("connected") or account_info is None:
-        raise HTTPException(status_code=503, detail="The linked MT5 terminal is not connected to an account.")
-    if str(account_info["login"]) != request.account_id or account_info["server"] != request.server:
-        raise HTTPException(status_code=409, detail=f"Connected MT5 account is {account_info['login']} on {account_info['server']}. Link that account instead.")
+    statuses = [broker.status() for broker in mt5_brokers]
+    account_info = next((status.get("account") for status in statuses if status.get("connected") and status.get("account") and str(status["account"]["login"]) == request.account_id and status["account"]["server"] == request.server), None)
+    if account_info is None:
+        errors = "; ".join(status.get("error", "not connected") for status in statuses)
+        raise HTTPException(status_code=503, detail=f"MT5 account is not connected: {errors}. Log into {request.server} in MetaTrader 5, then try again.")
     now = datetime.now(UTC).isoformat()
     connection = sqlite3.connect(DATABASE_PATH)
     connection.execute("INSERT INTO broker_accounts (broker, account_id, server, mode, created_at) VALUES (?, ?, ?, 'live', ?)", (request.broker, request.account_id, request.server, now))
@@ -354,11 +386,21 @@ def market(instrument: str) -> dict:
 def create_cycle(request: CycleRequest) -> dict:
     if not LIVE_TRADING_ENABLED or not LIVE_TRADING_CONFIRMATION:
         raise HTTPException(status_code=403, detail="Live execution requires LIVE_TRADING_ENABLED=true and LIVE_TRADING_CONFIRMATION=I_UNDERSTAND_REAL_MONEY")
-    try:
-        orders = mt5_broker.open_market_orders(request.instrument, request.direction, request.positions, request.take_profit_pips, request.stop_loss_pips)
-    except RuntimeError as error:
-        raise HTTPException(status_code=502, detail=str(error)) from error
-    return {"instrument": request.instrument, "direction": request.direction, "positions": len(orders), "orders": orders, "mode": "live", "status": "OPEN"}
+    results = []
+    errors = []
+    for broker in mt5_brokers:
+        try:
+            positions = broker.positions()
+            if instrument_has_open_position(request.instrument, positions, broker):
+                results.append({"account_id": broker.config.account_id, "status": "SKIPPED", "reason": "Position or pending order already exists"})
+                continue
+            orders = broker.open_market_orders(request.instrument, request.direction, request.positions, request.take_profit_pips, request.stop_loss_pips, RISK_PERCENT)
+            results.append({"account_id": broker.config.account_id, "status": "OPEN", "orders": orders})
+        except RuntimeError as error:
+            errors.append({"account_id": broker.config.account_id, "error": str(error)})
+    if not any(result["status"] == "OPEN" for result in results):
+        raise HTTPException(status_code=502, detail={"message": "No configured MT5 account accepted the trade", "accounts": results, "errors": errors})
+    return {"instrument": request.instrument, "direction": request.direction, "positions": sum(len(result.get("orders", [])) for result in results), "accounts": results, "account_errors": errors, "mode": "live", "status": "OPEN"}
 
 
 @app.get("/api/history")

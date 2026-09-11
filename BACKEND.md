@@ -12,6 +12,16 @@ From the project root:
 
 The API runs at `http://127.0.0.1:8000`. Interactive API docs are available at `http://127.0.0.1:8000/docs`.
 
+Run `.\run-backend.ps1` from the project root. It loads `.env` as the project configuration source; this prevents stale global trading flags from overriding the project configuration. Keep `LIVE_TRADING_ENABLED=false` while validating a demo connection. To submit demo or live MT5 orders, set it to `true` and set `LIVE_TRADING_CONFIRMATION=I_UNDERSTAND_REAL_MONEY` only after verifying the account and symbol settings.
+
+Multiple MT5 accounts use `MT5_ACCOUNTS` as a JSON array. Each account needs its own MT5 terminal path when accounts are different; the adapter connects to each profile sequentially and applies the configured risk percentage independently:
+
+```env
+MT5_ACCOUNTS=[{"id":"demo-1","path":"C:/MT5/Demo/terminal64.exe","login":123456,"password":"...","server":"Exness-MT5Trial9","symbol_suffix":"m"},{"id":"live-1","path":"C:/MT5/Live/terminal64.exe","login":654321,"password":"...","server":"Exness-Real9","symbol_suffix":"m"}]
+```
+
+Do not put credentials in source control. The bot skips an account with an existing position/order and reports per-account execution results; it trades only on profiles that connect successfully.
+
 The frontend uses `http://127.0.0.1:8000` during local Vite development. For a deployed frontend, set the Vercel environment variable `VITE_API_BASE_URL` to the public backend origin, without `/api`. Set the backend variable `FRONTEND_ORIGINS` to `https://250pips.vercel.app`, then redeploy both services.
 
 ## Endpoints

@@ -1,9 +1,24 @@
-$python = 'c:/Users/DELL/AppData/Local/Python/PYTHONCORE-3.14-64/python.exe'
+$python = Join-Path $PSScriptRoot '.venv-1\Scripts\python.exe'
 if (-not (Test-Path $python)) { $python = 'python' }
 
-foreach ($name in @('BROKER', 'LIVE_TRADING_ENABLED', 'LIVE_TRADING_CONFIRMATION', 'MT5_LOGIN', 'MT5_PASSWORD', 'MT5_SERVER', 'MT5_PATH', 'MT5_SYMBOL_SUFFIX', 'MT5_VOLUME_PER_POSITION')) {
-	$value = [Environment]::GetEnvironmentVariable($name, 'User')
-	if ($null -ne $value) { Set-Item "Env:$name" $value }
+$envFile = Join-Path $PSScriptRoot '.env'
+$projectVariables = @('BROKER', 'LIVE_TRADING_ENABLED', 'LIVE_TRADING_CONFIRMATION', 'MT5_LOGIN', 'MT5_PASSWORD', 'MT5_SERVER', 'MT5_PATH', 'MT5_SYMBOL_SUFFIX', 'MT5_VOLUME_PER_POSITION', 'MT5_ACCOUNTS')
+foreach ($name in $projectVariables) {
+	Remove-Item "Env:$name" -ErrorAction SilentlyContinue
+}
+if (Test-Path $envFile) {
+	foreach ($line in Get-Content $envFile) {
+		$trimmed = $line.Trim()
+		if ([string]::IsNullOrWhiteSpace($trimmed) -or $trimmed.StartsWith('#')) { continue }
+		$separator = $trimmed.IndexOf('=')
+		if ($separator -lt 1) { continue }
+		$name = $trimmed.Substring(0, $separator).Trim()
+		$value = $trimmed.Substring($separator + 1).Trim()
+		if (($value.StartsWith('"') -and $value.EndsWith('"')) -or ($value.StartsWith("'") -and $value.EndsWith("'"))) {
+			$value = $value.Substring(1, $value.Length - 2)
+		}
+		Set-Item "Env:$name" $value
+	}
 }
 
 & $python -m uvicorn backend.app.main:app --host 127.0.0.1 --port 8000

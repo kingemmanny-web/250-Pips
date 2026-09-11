@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 from dataclasses import dataclass
 from typing import Any
 
@@ -20,6 +21,7 @@ class MT5Config:
     server: str | None
     symbol_suffix: str
     volume_per_position: float
+    account_id: str = "primary"
 
     @classmethod
     def from_environment(cls) -> MT5Config:
@@ -31,7 +33,35 @@ class MT5Config:
             server=os.getenv("MT5_SERVER", "").strip() or None,
             symbol_suffix=os.getenv("MT5_SYMBOL_SUFFIX", "").strip(),
             volume_per_position=float(os.getenv("MT5_VOLUME_PER_POSITION", "0.01")),
+            account_id="primary",
         )
+
+    @classmethod
+    def profiles_from_environment(cls) -> list[MT5Config]:
+        raw = os.getenv("MT5_ACCOUNTS", "").strip()
+        if not raw:
+            return [cls.from_environment()]
+        try:
+            profiles = json.loads(raw)
+        except json.JSONDecodeError as error:
+            raise RuntimeError(f"MT5_ACCOUNTS must be valid JSON: {error}") from error
+        if not isinstance(profiles, list) or not profiles:
+            raise RuntimeError("MT5_ACCOUNTS must contain at least one account profile")
+        result = []
+        for index, profile in enumerate(profiles, start=1):
+            if not isinstance(profile, dict):
+                raise RuntimeError(f"MT5 account profile {index} must be an object")
+            login_value = str(profile.get("login", "")).strip()
+            result.append(cls(
+                path=str(profile.get("path", "")).strip() or None,
+                login=int(login_value) if login_value else None,
+                password=str(profile.get("password", "")).strip() or None,
+                server=str(profile.get("server", "")).strip() or None,
+                symbol_suffix=str(profile.get("symbol_suffix", "")).strip(),
+                volume_per_position=float(profile.get("volume_per_position", os.getenv("MT5_VOLUME_PER_POSITION", "0.01"))),
+                account_id=str(profile.get("id", f"account-{index}")),
+            ))
+        return result
 
     @property
     def configured(self) -> bool:
@@ -77,6 +107,7 @@ class MT5Adapter:
             info = mt5.account_info()
             return {
                 "package_installed": True,
+                "account_id": self.config.account_id,
                 "configured": self.config.configured,
                 "connected": info is not None,
                 "account": self._account_payload(info) if info is not None else None,
