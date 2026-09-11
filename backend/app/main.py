@@ -359,16 +359,18 @@ def account() -> dict:
 @app.post("/api/broker/link")
 def link_broker(request: BrokerLinkRequest) -> dict:
     statuses = [broker.status() for broker in mt5_brokers]
-    account_info = next((status.get("account") for status in statuses if status.get("connected") and status.get("account") and str(status["account"]["login"]) == request.account_id and status["account"]["server"] == request.server), None)
+    requested_account_id = request.account_id.strip()
+    account_info = next((status.get("account") for status in statuses if status.get("connected") and status.get("account") and (str(status["account"]["login"]) == requested_account_id or ("****" in requested_account_id and requested_account_id == f"{str(status['account']['login'])[:3]}****{str(status['account']['login'])[-2:]}")) and status["account"]["server"] == request.server), None)
     if account_info is None:
         errors = "; ".join(status.get("error", "not connected") for status in statuses)
         raise HTTPException(status_code=503, detail=f"MT5 account is not connected: {errors}. Log into {request.server} in MetaTrader 5, then try again.")
+    verified_account_id = str(account_info["login"])
     now = datetime.now(UTC).isoformat()
     connection = sqlite3.connect(DATABASE_PATH)
-    connection.execute("INSERT INTO broker_accounts (broker, account_id, server, mode, created_at) VALUES (?, ?, ?, 'live', ?)", (request.broker, request.account_id, request.server, now))
+    connection.execute("INSERT INTO broker_accounts (broker, account_id, server, mode, created_at) VALUES (?, ?, ?, 'live', ?)", (request.broker, verified_account_id, request.server, now))
     connection.commit()
     connection.close()
-    return {"status": "linked_for_live", "broker": request.broker, "account_id": f"{request.account_id[:3]}****{request.account_id[-2:]}", "server": request.server, "live_verified": True}
+    return {"status": "linked_for_live", "broker": request.broker, "account_id": f"{verified_account_id[:3]}****{verified_account_id[-2:]}", "server": request.server, "live_verified": True}
 
 
 @app.get("/api/market/{instrument}")

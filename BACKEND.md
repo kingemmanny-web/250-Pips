@@ -10,6 +10,8 @@ From the project root:
 .\run-backend.ps1
 ```
 
+To start the local backend and frontend together in separate PowerShell windows, run `.start-local.ps1`.
+
 The API runs at `http://127.0.0.1:8000` locally. Interactive API docs are available at `http://127.0.0.1:8000/docs`. The launcher binds to `0.0.0.0` and honors the hosting platform's `PORT` variable when deployed.
 
 Run `.\run-backend.ps1` from the project root. It loads `.env` as the project configuration source; this prevents stale global trading flags from overriding the project configuration. Keep `LIVE_TRADING_ENABLED=false` while validating a demo connection. To submit demo or live MT5 orders, set it to `true` and set `LIVE_TRADING_CONFIRMATION=I_UNDERSTAND_REAL_MONEY` only after verifying the account and symbol settings.
